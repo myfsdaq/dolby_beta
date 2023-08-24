@@ -113,6 +113,13 @@ public class PlayerActivityHook {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                         super.beforeHookedMethod(param);
+                        super.afterHookedMethod(param);
+                        param.args[0]= SettingHelper.getInstance().getPictureUrl();
+                        param.args[2]= SettingHelper.getInstance().getBackgroundBlur();
+                    }
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        super.afterHookedMethod(param);
+                        super.beforeHookedMethod(param);
                         param.args[0]= SettingHelper.getInstance().getPictureUrl();
                         param.args[2]= SettingHelper.getInstance().getBackgroundBlur();
                     }

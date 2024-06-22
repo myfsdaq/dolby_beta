@@ -35,6 +35,6 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: app-release
-          path: ${{github.workspace}}/app/build/outputs/apk/release/*.apk
+          path: out/*.apk
           if-no-files-found: warn
           retention-days: 30

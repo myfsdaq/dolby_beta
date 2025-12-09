@@ -82,7 +82,7 @@ public class ClassHelper {
                 classCacheList = new ArrayList<>();
             if (classCacheList.size() == 0) {
                 // 默认仅加载网易云和okhttp相关类
-                new Thread(() -> getCacheClassByZip(context, version, listener, false)).start();
+                new Thread(() -> getCacheClassByZip(context, version, listener, true)).start();
             } else
                 listener.onGet();
         } else

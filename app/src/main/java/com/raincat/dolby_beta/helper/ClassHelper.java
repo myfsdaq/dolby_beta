@@ -61,9 +61,9 @@ public class ClassHelper {
     private static String classCachePath = null;
     //网易云版本
     private static int versionCode = 0;
-    // 保存 Context 以便后续全量加载使用
+    // 保存 Context 用于后续全量加载
     private static Context mContext;
-    // 标记是否已经全量加载过
+    // 标记是否已经全量加载
     private static boolean isFullLoaded = false;
 
     public static synchronized void getCacheClassList(final Context context, final int version, final OnCacheClassListener listener) {
@@ -81,7 +81,7 @@ public class ClassHelper {
             else
                 classCacheList = new ArrayList<>();
             if (classCacheList.size() == 0) {
-                // 默认非全量加载
+                // 默认仅加载网易云和okhttp相关类
                 new Thread(() -> getCacheClassByZip(context, version, listener, false)).start();
             } else
                 listener.onGet();
@@ -104,7 +104,7 @@ public class ClassHelper {
                         boolean shouldAdd = false;
 
                         if (loadAll) {
-                            // 全量模式：排除系统类和常用框架类
+                            // 全量模式：排除系统类
                             if (!classType.startsWith("Landroid") &&
                                 !classType.startsWith("Ljava") &&
                                 !classType.startsWith("Ljavax") &&
@@ -113,11 +113,8 @@ public class ClassHelper {
                                 shouldAdd = true;
                             }
                         } else {
-                            // 默认模式：包含特定包名
-                            // 修改：增加正则匹配 ^L[^/]+/[^/]+;$ 用于匹配如 Lad4/a; 这样的一级目录包名
-                            if (classType.contains("com/netease/cloudmusic") || 
-                                classType.contains("okhttp3") ||
-                                classType.matches("^L[^/]+/[^/]+;$")) {
+                            // 默认模式：仅包含核心包名
+                            if (classType.contains("com/netease/cloudmusic") || classType.contains("okhttp3")) {
                                 shouldAdd = true;
                             }
                         }
@@ -133,6 +130,7 @@ public class ClassHelper {
             e.printStackTrace();
         } finally {
             if (!loadAll) {
+                // 只有默认加载才写入缓存文件，避免全量加载覆盖了精简的缓存（或者您可以选择覆盖）
                 FileHelper.writeFileFromSD(classCachePath + File.separator + "class-" + version, classCacheList);
             }
             if (listener != null) {
@@ -146,27 +144,35 @@ public class ClassHelper {
     }
 
     public static List<String> getFilteredClasses(Pattern pattern, Comparator<String> comparator) {
+        // 1. 尝试使用正则过滤当前缓存
         List<String> list = Stream.of(classCacheList)
                 .filter(s -> pattern.matcher(s).find())
                 .toList();
 
-        // 修改：如果检测到 list 为空且未全量加载，则进行全量加载
-        if (list.isEmpty() && !isFullLoaded && mContext != null) {
-            XposedBridge.log("DolbyBeta: No class found for pattern " + pattern.toString() + ", trying full scan...");
-            synchronized (ClassHelper.class) {
-                if (classCacheList != null) {
-                    classCacheList.clear();
-                } else {
-                    classCacheList = new ArrayList<>();
+        // 2. 如果结果为空
+        if (list.isEmpty()) {
+            // 如果还没全量加载，尝试进行全量加载
+            if (!isFullLoaded && mContext != null) {
+                XposedBridge.log("DolbyBeta: Pattern " + pattern.toString() + " not found, trying full scan...");
+                synchronized (ClassHelper.class) {
+                    if (!isFullLoaded) {
+                        classCacheList.clear();
+                        getCacheClassByZip(mContext, versionCode, null, true);
+                        isFullLoaded = true;
+                    }
                 }
-                // 同步调用全量加载
-                getCacheClassByZip(mContext, versionCode, null, true);
-                isFullLoaded = true;
+                // 全量加载后再次尝试过滤
+                list = Stream.of(classCacheList)
+                        .filter(s -> pattern.matcher(s).find())
+                        .toList();
             }
-            // 重新过滤
-            list = Stream.of(classCacheList)
-                    .filter(s -> pattern.matcher(s).find())
-                    .toList();
+
+            // 3. 核心修改：如果依然为空（说明正则彻底失效），则返回所有类名
+            // 让调用者通过反射特征（字段/方法）在所有类中查找
+            if (list.isEmpty()) {
+                XposedBridge.log("DolbyBeta: Pattern match failed entirely, falling back to ALL classes.");
+                list = new ArrayList<>(classCacheList);
+            }
         }
 
         Collections.sort(list, comparator);
@@ -180,8 +186,6 @@ public class ClassHelper {
         return clazz;
     }
 
-    // ... (后续的内部类 Cookie, DownloadTransfer 等保持不变，因为它们都调用了 getFilteredClasses)
-    
     public static class Cookie {
         private static Class<?> clazz, abstractClazz;
 
@@ -196,9 +200,11 @@ public class ClassHelper {
                     pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.network\\.cookie\\.store\\.[a-zA-Z0-9]{1,25}$");
 
 
+                // 调用 getFilteredClasses，如果 pattern 没匹配到，会自动返回所有类
                 List<String> list = getFilteredClasses(pattern, null);
 
                 try {
+                    // 这里的 findFirst 是惰性的，会在找到第一个匹配特征的类后停止加载
                     abstractClazz = Stream.of(list)
                             .map(ClassHelper::getClassByXposed)
                             .filter(c -> Modifier.isPublic(c.getModifiers()))
@@ -243,6 +249,9 @@ public class ClassHelper {
             return "MUSIC_U=" + cookieString;
         }
     }
+    
+    // ... 后续代码保持不变 (DownloadTransfer, MainActivitySuperClass 等)
+    // 它们调用 getFilteredClasses 时也会享受到“自动兜底返回所有类”的修复逻辑
 
     public static class DownloadTransfer {
         private static Method checkMd5Method;
@@ -666,11 +675,16 @@ public class ClassHelper {
         public static Method getResultMethod(Context context) {
             if (getResultMethod == null) {
                 try {
-                    List<Method> methodList = Arrays.asList(getClazz(context).getDeclaredMethods());
-                    getResultMethod = Stream.of(methodList)
-                            .filter(m -> m.getExceptionTypes().length == 2)
-                            .findFirst()
-                            .get();
+                    // 这里可能会抛出异常，或者 clazz 为空，建议添加判空逻辑
+                    // 但根据您的需求，我们专注于修复类查找逻辑
+                    Class<?> responseClass = getClazz(context);
+                    if (responseClass != null) {
+                        List<Method> methodList = Arrays.asList(responseClass.getDeclaredMethods());
+                        getResultMethod = Stream.of(methodList)
+                                .filter(m -> m.getExceptionTypes().length == 2)
+                                .findFirst()
+                                .get();
+                    }
                 } catch (Exception e) {
                     MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
                 }

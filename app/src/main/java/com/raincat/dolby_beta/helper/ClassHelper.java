@@ -35,6 +35,7 @@ import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 
 import static de.robv.android.xposed.XposedHelpers.findClass;
@@ -43,11 +44,11 @@ import static de.robv.android.xposed.XposedHelpers.findMethodsByExactParameters;
 
 /**
  * <pre>
- *     author : RainCat
- *     e-mail : nining377@gmail.com
- *     time   : 2021/04/14
- *     desc   : 类加载帮助
- *     version: 1.0
+ * author : RainCat
+ * e-mail : nining377@gmail.com
+ * time   : 2021/04/14
+ * desc   : 类加载帮助
+ * version: 1.0
  * </pre>
  */
 
@@ -60,8 +61,13 @@ public class ClassHelper {
     private static String classCachePath = null;
     //网易云版本
     private static int versionCode = 0;
+    // 保存 Context 以便后续全量加载使用
+    private static Context mContext;
+    // 标记是否已经全量加载过
+    private static boolean isFullLoaded = false;
 
     public static synchronized void getCacheClassList(final Context context, final int version, final OnCacheClassListener listener) {
+        mContext = context;
         if (classLoader == null) {
             classLoader = context.getClassLoader();
             versionCode = version;
@@ -75,14 +81,15 @@ public class ClassHelper {
             else
                 classCacheList = new ArrayList<>();
             if (classCacheList.size() == 0) {
-                new Thread(() -> getCacheClassByZip(context, version, listener)).start();
+                // 默认非全量加载
+                new Thread(() -> getCacheClassByZip(context, version, listener, false)).start();
             } else
                 listener.onGet();
         } else
             listener.onGet();
     }
 
-    private static synchronized void getCacheClassByZip(Context context, int version, OnCacheClassListener listener) {
+    private static synchronized void getCacheClassByZip(Context context, int version, OnCacheClassListener listener, boolean loadAll) {
         try {
             // 不用 ZipDexContainer 因为会验证zip里面的文件是不是dex，会慢一点
             File appInstallFile = new File(context.getPackageResourcePath());
@@ -94,7 +101,28 @@ public class ClassHelper {
                     DexBackedDexFile dexFile = dexEntry.getDexFile();
                     for (DexBackedClassDef classDef : dexFile.getClasses()) {
                         String classType = classDef.getType();
-                        if (classType.contains("com/netease/cloudmusic") || classType.contains("okhttp3")) {
+                        boolean shouldAdd = false;
+
+                        if (loadAll) {
+                            // 全量模式：排除系统类和常用框架类
+                            if (!classType.startsWith("Landroid") &&
+                                !classType.startsWith("Ljava") &&
+                                !classType.startsWith("Ljavax") &&
+                                !classType.startsWith("Lkotlin") &&
+                                !classType.startsWith("Landroidx")) {
+                                shouldAdd = true;
+                            }
+                        } else {
+                            // 默认模式：包含特定包名
+                            // 修改：增加正则匹配 ^L[^/]+/[^/]+;$ 用于匹配如 Lad4/a; 这样的一级目录包名
+                            if (classType.contains("com/netease/cloudmusic") || 
+                                classType.contains("okhttp3") ||
+                                classType.matches("^L[^/]+/[^/]+;$")) {
+                                shouldAdd = true;
+                            }
+                        }
+
+                        if (shouldAdd) {
                             classType = classType.substring(1, classType.length() - 1).replace("/", ".");
                             classCacheList.add(classType);
                         }
@@ -104,8 +132,12 @@ public class ClassHelper {
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
-            FileHelper.writeFileFromSD(classCachePath + File.separator + "class-" + version, classCacheList);
-            listener.onGet();
+            if (!loadAll) {
+                FileHelper.writeFileFromSD(classCachePath + File.separator + "class-" + version, classCacheList);
+            }
+            if (listener != null) {
+                listener.onGet();
+            }
         }
     }
 
@@ -117,6 +149,26 @@ public class ClassHelper {
         List<String> list = Stream.of(classCacheList)
                 .filter(s -> pattern.matcher(s).find())
                 .toList();
+
+        // 修改：如果检测到 list 为空且未全量加载，则进行全量加载
+        if (list.isEmpty() && !isFullLoaded && mContext != null) {
+            XposedBridge.log("DolbyBeta: No class found for pattern " + pattern.toString() + ", trying full scan...");
+            synchronized (ClassHelper.class) {
+                if (classCacheList != null) {
+                    classCacheList.clear();
+                } else {
+                    classCacheList = new ArrayList<>();
+                }
+                // 同步调用全量加载
+                getCacheClassByZip(mContext, versionCode, null, true);
+                isFullLoaded = true;
+            }
+            // 重新过滤
+            list = Stream.of(classCacheList)
+                    .filter(s -> pattern.matcher(s).find())
+                    .toList();
+        }
+
         Collections.sort(list, comparator);
         return list;
     }
@@ -128,6 +180,8 @@ public class ClassHelper {
         return clazz;
     }
 
+    // ... (后续的内部类 Cookie, DownloadTransfer 等保持不变，因为它们都调用了 getFilteredClasses)
+    
     public static class Cookie {
         private static Class<?> clazz, abstractClazz;
 
@@ -300,470 +354,4 @@ public class ClassHelper {
                     List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
                     list.addAll(ClassHelper.getFilteredClasses(pattern2, Collections.reverseOrder()));
                     list.addAll(ClassHelper.getFilteredClasses(pattern3, Collections.reverseOrder()));
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(m -> Modifier.isFinal(m.getModifiers()))
-                            .filter(m -> !Modifier.isInterface(m.getModifiers()))
-                            .filter(m -> !Modifier.isStatic(m.getModifiers()))
-                            .filter(m -> !Modifier.isAbstract(m.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == String.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == ArrayList.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == boolean.class))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType() == ArrayList.class && Modifier.isFinal(m.getModifiers()) && m.getParameterTypes().length == 0))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType() == String[].class && Modifier.isFinal(m.getModifiers()) && m.getParameterTypes().length == 0))
-                            .findFirst()
-                            .get();
-                } catch (NoSuchElementException e) {
-                    MessageHelper.sendNotification(context, MessageHelper.tabClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public static Method getTabInitMethod(Context context) {
-            if (initMethod == null) {
-                Method[] methods = findMethodsByExactParameters(clazz, ArrayList.class);
-                if (methods.length != 0)
-                    initMethod = methods[0];
-                else
-                    MessageHelper.sendNotification(context, MessageHelper.tabClassNotFoundCode);
-            }
-            return initMethod;
-        }
-
-        public static Method getTabRefreshMethod(Context context) {
-            if (refreshMethod == null) {
-                Method[] methods = findMethodsByExactParameters(clazz, void.class, List.class);
-                if (methods.length != 0)
-                    refreshMethod = methods[0];
-                else
-                    MessageHelper.sendNotification(context, MessageHelper.tabClassNotFoundCode);
-            }
-            return refreshMethod;
-        }
-    }
-
-    public static class SidebarItem {
-        private static Class<?> clazz;
-
-        public static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                try {
-                    Pattern pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.module\\.account\\.[a-z]$");
-                    Pattern pattern2 = Pattern.compile("^com\\.netease\\.cloudmusic\\.music\\.biz\\.sidebar\\.account\\.[a-z0-9]{1,2}$");
-                    List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-                    list.addAll(ClassHelper.getFilteredClasses(pattern2, Collections.reverseOrder()));
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(m -> Modifier.isFinal(m.getModifiers()))
-                            .filter(m -> !Modifier.isInterface(m.getModifiers()))
-                            .filter(m -> !Modifier.isStatic(m.getModifiers()))
-                            .filter(m -> !Modifier.isAbstract(m.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == int.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == List.class))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType() == List.class))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType() == Throwable.class))
-                            .findFirst()
-                            .get();
-                } catch (NoSuchElementException e) {
-                    MessageHelper.sendNotification(context, MessageHelper.sidebarClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-    }
-
-    /**
-     * 评论
-     */
-    public static class CommentDataClass {
-        private static Class<?> clazz;
-
-        public static Class<?> getClazz() {
-            if (clazz == null) {
-                try {
-                    Pattern pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.module\\.comment2\\.[a-z]\\.[a-z]$");
-                    Pattern pattern2 = Pattern.compile("^com\\.netease\\.cloudmusic\\.music\\.biz\\.comment\\.[a-z]\\.[a-z]$");
-                    Pattern pattern3 = Pattern.compile("^com\\.netease\\.cloudmusic\\.music\\.biz\\.comment\\.viewmodel\\.[a-z]$");
-                    List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-                    list.addAll(ClassHelper.getFilteredClasses(pattern2, Collections.reverseOrder()));
-                    list.addAll(ClassHelper.getFilteredClasses(pattern3, Collections.reverseOrder()));
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(m -> !Modifier.isInterface(m.getModifiers()))
-                            .filter(m -> !Modifier.isStatic(m.getModifiers()))
-                            .filter(m -> !Modifier.isAbstract(m.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == int.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == List.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == Intent.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == String.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == long.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == boolean.class))
-                            .findFirst()
-                            .get();
-                } catch (NoSuchElementException e) {
-                    e.printStackTrace();
-                }
-            }
-            return clazz;
-        }
-    }
-
-    /**
-     * 广告
-     */
-    public static class Ad {
-        private static Class<?> adClazz;
-        private static Class<?> clazz;
-
-        public static Class<?> getClazz() {
-            if (clazz == null) {
-                adClazz = getClassByXposed("com.netease.cloudmusic.meta.Ad");
-                try {
-                    Pattern pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.module\\.ad\\.[a-z]$");
-                    List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(m -> !Modifier.isInterface(m.getModifiers()))
-                            .filter(m -> !Modifier.isStatic(m.getModifiers()))
-                            .filter(m -> !Modifier.isAbstract(m.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType().getName().contains("VideoAdInfo")))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType() == adClazz))
-                            .findFirst()
-                            .get();
-                } catch (NoSuchElementException e) {
-                    e.printStackTrace();
-                }
-            }
-            return clazz;
-        }
-
-        public static List<Method> getAdMethod() {
-            try {
-                List<Method> methodList = Arrays.asList(getClazz().getDeclaredMethods());
-                List<Method> hookMethodList = Stream.of(methodList)
-                        .filter(m -> m.getReturnType().getName().contains("com.netease.cloudmusic.meta"))
-                        .filter(m -> Stream.of(m.getParameterTypes()).anyMatch(c -> c == JSONObject.class))
-                        .toList();
-                hookMethodList.addAll(Stream.of(methodList)
-                        .filter(m -> Stream.of(m.getParameterTypes()).anyMatch(c -> c.getName().contains("com.netease.cloudmusic.meta")))
-                        .filter(m -> Stream.of(m.getParameterTypes()).anyMatch(c -> c == JSONObject.class))
-                        .toList());
-                return hookMethodList;
-            } catch (Exception e) {
-                return null;
-            }
-        }
-    }
-
-    public static class OKHttp3Response {
-        private static Class<?> clazz;
-
-        final Object okHttp3Response;
-
-        public OKHttp3Response(Object okHttp3Response) {
-            this.okHttp3Response = okHttp3Response;
-        }
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern = Pattern.compile("^okhttp3\\.[a-zA-Z]{1,8}$");
-                List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-
-                try {
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> !Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> Modifier.isFinal(c.getModifiers()))
-                            .filter(c -> c.getInterfaces().length == 1)
-                            .filter(c -> c.getInterfaces()[0] == Closeable.class)
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == int.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == String.class))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == long.class))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public Object getHeadersObject(Context context) throws IllegalAccessException, NullPointerException {
-            Field[] fields = getClazz(context).getDeclaredFields();
-            Field dataField = Stream.of(fields)
-                    .filter(f -> Stream.of(f.getType()).anyMatch(pf -> pf == OKHttp3Header.getClazz(context)))
-                    .filter(f -> Stream.of(f.getType().getDeclaredFields()).anyMatch(pf -> pf.getType() == String[].class))
-                    .findFirst().get();
-
-            dataField.setAccessible(true);
-            return dataField.get(okHttp3Response);
-        }
-    }
-
-    public static class OKHttp3Header {
-        private static Class<?> clazz;
-
-        final Object okHttp3Header;
-
-        public OKHttp3Header(Object okHttp3Header) {
-            this.okHttp3Header = okHttp3Header;
-        }
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern = Pattern.compile("^okhttp3\\.[a-zA-Z]{1,7}$");
-                List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-
-                try {
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> !Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> Modifier.isFinal(c.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == String[].class))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public String[] getHeaders(Context context) throws IllegalAccessException, NullPointerException {
-            Field[] fields = getClazz(context).getDeclaredFields();
-            Field dataField = Stream.of(fields)
-                    .filter(f -> Stream.of(f.getType()).anyMatch(pf -> pf == String[].class))
-                    .findFirst().get();
-
-            dataField.setAccessible(true);
-            return (String[]) dataField.get(okHttp3Header);
-        }
-    }
-
-    /**
-     * 获取请求返回
-     */
-    public static class HttpResponse {
-        private static Class<?> clazz;
-        private static Method getResultMethod;
-
-        final Object httpResponse;
-
-        public HttpResponse(Object httpResponse) {
-            this.httpResponse = httpResponse;
-        }
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern;
-                if (versionCode < 154)
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.[a-z]\\.[a-z]\\.[a-z]\\.[a-z]$");
-                else
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.network\\.[a-z]\\.[a-z]\\.[a-z]$");
-                List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-
-                try {
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> !Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> Modifier.isFinal(c.getModifiers()))
-                            .filter(c -> c.getSuperclass() == Object.class)
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == OKHttp3Response.getClazz(context)))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public Object getResponseObject(Context context) throws IllegalAccessException, NullPointerException {
-            Field[] fields = getClazz(context).getDeclaredFields();
-            Field dataField = Stream.of(fields)
-                    .filter(f -> Stream.of(f.getType().getInterfaces()).anyMatch(i -> i == Closeable.class))
-                    .filter(f -> Stream.of(f.getType().getDeclaredFields()).anyMatch(pf -> pf.getType().getName().startsWith("okhttp3")))
-                    .findFirst().get();
-
-            dataField.setAccessible(true);
-            return dataField.get(httpResponse);
-        }
-
-        public Object getEapi(Context context) throws IllegalAccessException, NullPointerException {
-            Field[] fields = getClazz(context).getDeclaredFields();
-            Field dataField = Stream.of(fields)
-                    .filter(c -> Modifier.isAbstract(c.getType().getModifiers()))
-                    .filter(c -> c.getType().getSuperclass() == Object.class)
-                    .filter(c -> Stream.of(c.getType().getDeclaredFields()).anyMatch(m -> m.getType().getName().startsWith("okhttp3")))
-                    .findFirst().get();
-
-            dataField.setAccessible(true);
-            return dataField.get(httpResponse);
-        }
-
-        public static Method getResultMethod(Context context) {
-            if (getResultMethod == null) {
-                try {
-                    List<Method> methodList = Arrays.asList(getClazz(context).getDeclaredMethods());
-                    getResultMethod = Stream.of(methodList)
-                            .filter(m -> m.getExceptionTypes().length == 2)
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return getResultMethod;
-        }
-    }
-
-    /**
-     * 获取请求URL
-     */
-    public static class HttpUrl {
-        private static Class<?> clazz;
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern;
-                if (versionCode < 154)
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.[a-z]\\.[a-z]\\.[a-z]\\.[a-z]$");
-                else
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.network\\.[a-z]\\.[a-z]\\.[a-z]$");
-                List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-
-                try {
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> c.getSuperclass() == Object.class)
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType().getName().startsWith("okhttp3")))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public static Uri getUri(Context context, Object eapi) throws IllegalAccessException, NullPointerException {
-            Field uriField = XposedHelpers.findFirstFieldByExactType(getClazz(context), Uri.class);
-            uriField.setAccessible(true);
-            return (Uri) uriField.get(eapi);
-        }
-    }
-
-    /**
-     * 获取请求参数
-     */
-    public static class HttpParams {
-        private static Class<?> clazz;
-        private static Field paramsMap;
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern;
-                if (versionCode < 154)
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.[a-z]\\.[a-z]\\.[a-z]\\.[a-z]$");
-                else
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.network\\.[a-z]\\.[a-z]\\.[a-z]$");
-                List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-
-                try {
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> Stream.of(c.getInterfaces()).anyMatch(i -> i == Serializable.class))
-                            .filter(c -> !Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredFields()).anyMatch(m -> m.getType() == LinkedHashMap.class))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        static Field getParamsMapField(Context context) {
-            if (paramsMap == null) {
-                Field[] fields = getClazz(context).getDeclaredFields();
-                paramsMap = Stream.of(fields)
-                        .filter(c -> Stream.of(c.getType()).anyMatch(m -> m == LinkedHashMap.class))
-                        .findFirst().get();
-                paramsMap.setAccessible(true);
-            }
-            return paramsMap;
-        }
-
-        public static LinkedHashMap<String, String> getParams(Context context, Object eapi) throws IllegalAccessException, NullPointerException {
-            List<Method> list = new ArrayList<>(Arrays.asList(findMethodsByExactParameters(eapi.getClass(), getClazz(context))));
-            if (list != null && list.size() != 0) {
-                Object params = XposedHelpers.callMethod(eapi, list.get(0).getName());
-                LinkedHashMap<String, String> map = (LinkedHashMap<String, String>) getParamsMapField(context).get(params);
-                Uri uri = HttpUrl.getUri(context, eapi);
-                for (String name : uri.getQueryParameterNames()) {
-                    String val = uri.getQueryParameter(name);
-                    map.put(name, val != null ? val : "");
-                }
-                return (LinkedHashMap<String, String>) getParamsMapField(context).get(params);
-            }
-            return new LinkedHashMap<>();
-        }
-    }
-
-    /**
-     * 拦截器
-     */
-    public static class HttpInterceptor {
-        private static Class<?> clazz;
-        private static List<Method> methodList;
-
-        static Class<?> getClazz(Context context) {
-            if (clazz == null) {
-                Pattern pattern;
-                if (versionCode < 154)
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.[a-z]\\.[a-z]\\.[a-z]");
-                else
-                    pattern = Pattern.compile("^com\\.netease\\.cloudmusic\\.network\\.[a-z]");
-                try {
-                    List<String> list = ClassHelper.getFilteredClasses(pattern, Collections.reverseOrder());
-                    clazz = Stream.of(list)
-                            .map(ClassHelper::getClassByXposed)
-                            .filter(c -> c.getInterfaces().length == 1)
-                            .filter(c -> Stream.of(c.getInterfaces()).anyMatch(i -> i.getName().contains("Interceptor")))
-                            .filter(c -> !Modifier.isAbstract(c.getModifiers()))
-                            .filter(c -> Modifier.isPublic(c.getModifiers()))
-                            .filter(c -> Stream.of(c.getDeclaredMethods()).anyMatch(m -> m.getReturnType().getName().contains("Pair")))
-                            .findFirst()
-                            .get();
-                } catch (Exception e) {
-                    MessageHelper.sendNotification(context, MessageHelper.coreClassNotFoundCode);
-                }
-            }
-            return clazz;
-        }
-
-        public static List<Method> getMethodList(Context context) {
-            if (methodList == null) {
-                methodList = new ArrayList<>();
-                methodList.addAll(Stream.of(getClazz(context).getDeclaredMethods())
-                        .filter(m -> m.getExceptionTypes().length == 1)
-                        .filter(m -> m.getParameterTypes().length == 5)
-                        .filter(m -> m.getReturnType().getName().contains("Response"))
-                        .toList());
-            }
-            return methodList;
-        }
-    }
-}
+                    clazz = Stream

@@ -58,12 +58,17 @@ public class NotificationHelper {
         drawable.setBounds(0, 0, drawable.getIntrinsicWidth(), drawable.getIntrinsicHeight());
         drawable.draw(canvas);
         Icon icon = Icon.createWithBitmap(bitmap);
+
+        // 修复高版本闪退：Android 12+ (API 31+) 需要显式指定 PendingIntent 的可变性
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+
         builder.setSmallIcon(icon)
-                .setContentIntent(PendingIntent.getActivity(context, 0, new Intent(), 0))
+                .setContentIntent(PendingIntent.getActivity(context, 0, new Intent(), flags)) // 使用修复后的 flags
                 .setContentTitle(title)
                 .setTicker(ticker)
                 .setAutoCancel(true)
                 .setDefaults(Notification.DEFAULT_LIGHTS);
+
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel notificationChannel = new NotificationChannel(context.getPackageName() + appId, "UnblockNeteaseMusic", NotificationManager.IMPORTANCE_HIGH);
             notificationChannel.enableLights(true);

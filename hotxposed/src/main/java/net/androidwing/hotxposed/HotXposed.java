@@ -10,6 +10,7 @@ import java.lang.reflect.Method;
 
 import dalvik.system.PathClassLoader;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge; // 建议引入 XposedBridge 打印日志
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
@@ -20,21 +21,33 @@ public class HotXposed {
     public static void hook(Class<?> clazz, XC_LoadPackage.LoadPackageParam lpparam)
             throws Exception {
         String packageName = clazz.getName().replace("." + clazz.getSimpleName(), "");
-        File apkFile = getApkFile(packageName, lpparam);
+        try {
+            File apkFile = getApkFile(packageName, lpparam);
 
-        if (!apkFile.exists()) {
-            Log.e("error", "apk file not found");
-            return;
-        }
+            if (!apkFile.exists()) {
+                Log.e("HotXposed", "apk file not found: " + apkFile.getAbsolutePath());
+                return;
+            }
 
-        filterNotify(lpparam);
+            filterNotify(lpparam);
 
-        PathClassLoader classLoader = new PathClassLoader(apkFile.getAbsolutePath(), lpparam.getClass().getClassLoader());
-        Class<?> cls = classLoader.loadClass(clazz.getName());
-        if (cls != null) {
-            Method method = cls.getDeclaredMethod("dispatch", XC_LoadPackage.LoadPackageParam.class);
-            method.setAccessible(true);
-            method.invoke(cls.newInstance(), lpparam);
+            PathClassLoader classLoader = new PathClassLoader(apkFile.getAbsolutePath(), lpparam.getClass().getClassLoader());
+            Class<?> cls = classLoader.loadClass(clazz.getName());
+            if (cls != null) {
+                Method method = cls.getDeclaredMethod("dispatch", XC_LoadPackage.LoadPackageParam.class);
+                method.setAccessible(true);
+                // 增加 try-catch 保护，防止模块内部错误炸毁宿主应用
+                try {
+                    method.invoke(cls.newInstance(), lpparam);
+                } catch (Throwable t) {
+                    XposedBridge.log("DolbyBeta: HotXposed dispatch failed");
+                    XposedBridge.log(t);
+                }
+            }
+        } catch (Throwable e) {
+            // 捕获获取 APK 文件等过程中的异常
+            XposedBridge.log("DolbyBeta: HotXposed init failed");
+            XposedBridge.log(e);
         }
     }
 

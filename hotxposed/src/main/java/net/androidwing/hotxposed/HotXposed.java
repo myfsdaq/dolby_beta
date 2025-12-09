@@ -10,12 +10,13 @@ import java.lang.reflect.Method;
 
 import dalvik.system.PathClassLoader;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge; // 建议引入 XposedBridge 打印日志
+import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Created  on 2018/3/30.
+ * Fixed for High API crash support
  */
 public class HotXposed {
     public static void hook(Class<?> clazz, XC_LoadPackage.LoadPackageParam lpparam)
@@ -70,7 +71,21 @@ public class HotXposed {
     }
 
     private static File getApkFile(String packageName, XC_LoadPackage.LoadPackageParam lpparam) throws PackageManager.NameNotFoundException {
-        Context systemContext = (Context) XposedHelpers.callMethod(XposedHelpers.callStaticMethod(XposedHelpers.findClass("android.app.ActivityThread", lpparam.classLoader), "currentActivityThread"), "getSystemContext");
+        // 修复：在高版本 Android 上，使用 BootClassLoader (null) 查找 ActivityThread 更稳健
+        // 同时拆分调用链以避免 NullPointerException
+        Object currentActivityThread = XposedHelpers.callStaticMethod(
+                XposedHelpers.findClass("android.app.ActivityThread", null), "currentActivityThread");
+
+        if (currentActivityThread == null) {
+            throw new IllegalStateException("Failed to get currentActivityThread, likely too early in process start");
+        }
+
+        Context systemContext = (Context) XposedHelpers.callMethod(currentActivityThread, "getSystemContext");
+        
+        if (systemContext == null) {
+            throw new IllegalStateException("Failed to get SystemContext");
+        }
+
         ApplicationInfo applicationInfo = systemContext.getPackageManager().getApplicationInfo(packageName, 0);
         return new File(applicationInfo.sourceDir);
     }
